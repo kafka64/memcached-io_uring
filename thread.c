@@ -29,6 +29,8 @@
 #include <openssl/ssl.h>
 #endif
 
+extern void drive_machine(conn *c);
+
 #define ITEMS_PER_ALLOC 64
 
 /* An item in the connection queue. */
@@ -526,7 +528,67 @@ static void *worker_libevent(void *arg) {
 
     register_thread_initialized();
 
+#ifdef IO_URING
+    LOG("initializing ring\n");
+
+    struct io_uring ring;
+    me->ring = &ring;
+    struct io_uring_sqe *sqe = NULL;
+    io_uring_queue_init(512, &ring, 0);
+
+    LOG("adding polling events for wakeup pipe\n");
+    sqe = io_uring_get_sqe(&ring);
+    io_uring_prep_poll_multishot(sqe, me->n.notify_event_fd , POLLIN);
+    io_uring_sqe_set_data(sqe, &me->n.notify_event_fd);
+    io_uring_submit(&ring);
+
+    LOG("starting cqe based event loop\n");
+
+    struct io_uring_cqe *cqe;
+    conn* c;
+    unsigned head;
+    unsigned n;
+
+    while(1) {
+        // TODO: timeout & batchsize
+        int ret = io_uring_submit_and_wait(&ring, 1);
+
+        LOG("new cqe| ");
+
+        // TODO: error handling
+        if (ret < 0) {
+            printf("io_uring_wait_cqe error\n");
+        }
+
+        n = 0;
+
+        io_uring_for_each_cqe(&ring, head, cqe) {
+            if (cqe->res < 0) {
+                printf("syscall failed\n");
+            }
+
+            if (*(int *)cqe->user_data == me->n.notify_event_fd) {
+                LOG("pipe (new connection)\n");
+                thread_libevent_process(me->n.notify_event_fd, 0, me);
+            } else {
+                LOG("socket (read|sendmsg)\n");
+                c = (conn *)cqe->user_data;
+                c->cqe = cqe;
+                drive_machine(c);
+            }
+
+            ++n;
+        }
+
+        io_uring_cq_advance(&ring, n);
+        //io_uring_cqe_seen(&ring, cqe);
+
+    }
+#else
     event_base_loop(me->base, 0);
+#endif
+
+    LOG("thread exiting\n");
 
     // same mechanism used to watch for all threads exiting.
     register_thread_initialized();
@@ -637,6 +699,9 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
                 } else {
                     c->thread = me;
                     conn_io_queue_setup(c);
+#ifdef IO_URING
+                    drive_machine(c);
+#endif
 #ifdef TLS
                     if (settings.ssl_enabled && c->ssl != NULL) {
                         assert(c->thread && c->thread->ssl_wbuf);

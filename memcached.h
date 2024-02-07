@@ -9,6 +9,9 @@
 #include "config.h"
 #endif
 
+#include <poll.h>
+#include <liburing.h>
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -717,6 +720,7 @@ struct thread_notify {
 
 typedef struct _mc_resp_bundle mc_resp_bundle;
 typedef struct {
+    struct io_uring *ring;      /* thread specific ring */
     pthread_t thread_id;        /* unique ID of this thread */
     struct event_base *base;    /* libevent handle this thread uses */
     struct thread_notify n;     /* for thread notification */
@@ -820,6 +824,12 @@ struct _io_pending_t {
  * The structure representing a connection into memcached.
  */
 struct conn {
+#ifdef IO_URING
+    bool wait_cqe; // expecting cqe?
+    struct io_uring_cqe *cqe;
+    struct iovec iovs[1024];
+    struct msghdr msg;
+#endif
     sasl_conn_t *sasl_conn;
     int    sfd;
     bool sasl_started;
@@ -1088,3 +1098,9 @@ extern void drop_worker_privileges(void);
 
 #define likely(x)       __builtin_expect((x),1)
 #define unlikely(x)     __builtin_expect((x),0)
+
+#ifdef LOG
+#define LOG(...) printf(__VA_ARGS__)
+#else
+#define LOG(...)
+#endif
