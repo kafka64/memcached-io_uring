@@ -534,55 +534,60 @@ static void *worker_libevent(void *arg) {
     struct io_uring ring;
     me->ring = &ring;
     struct io_uring_sqe *sqe = NULL;
-    io_uring_queue_init(512, &ring, 0);
+    io_uring_queue_init(2048, &ring,
+                        IORING_SETUP_SINGLE_ISSUER |
+                            IORING_SETUP_DEFER_TASKRUN |
+                            IORING_SETUP_COOP_TASKRUN);
 
     LOG("adding polling events for wakeup pipe\n");
     sqe = io_uring_get_sqe(&ring);
-    io_uring_prep_poll_multishot(sqe, me->n.notify_event_fd , POLLIN);
+    io_uring_prep_poll_multishot(sqe, me->n.notify_event_fd, POLLIN);
     io_uring_sqe_set_data(sqe, &me->n.notify_event_fd);
-    io_uring_submit(&ring);
 
     LOG("starting cqe based event loop\n");
 
+    struct __kernel_timespec ts = {
+        .tv_nsec = 40000,
+    };
     struct io_uring_cqe *cqe;
-    conn* c;
+    conn *c;
     unsigned head;
     unsigned n;
 
-    while(1) {
+    while (1) {
         // TODO: timeout & batchsize
-        int ret = io_uring_submit_and_wait(&ring, 1);
-
-        LOG("new cqe| ");
+        int ret = io_uring_submit_and_wait_timeout(&ring, &cqe, 10, &ts, NULL);
+        // int ret = io_uring_submit_and_wait(&ring, 1);
 
         // TODO: error handling
-        if (ret < 0) {
-            printf("io_uring_wait_cqe error\n");
-        }
+        if (ret >= 0 || ret == -ETIME) {
+            n = 0;
 
-        n = 0;
+            io_uring_for_each_cqe(&ring, head, cqe) {
+                LOG("new cqe| ");
+                if (cqe->res < 0) {
+                    printf("syscall failed\n");
+                }
 
-        io_uring_for_each_cqe(&ring, head, cqe) {
-            if (cqe->res < 0) {
-                printf("syscall failed\n");
+                if (*(int *)cqe->user_data == me->n.notify_event_fd) {
+                    LOG("pipe (new connection)\n");
+                    thread_libevent_process(me->n.notify_event_fd, 0, me);
+                } else {
+                    LOG("socket (read|sendmsg)\n");
+                    c = (conn *)cqe->user_data;
+                    c->cqe = cqe;
+                    drive_machine(c);
+                }
+
+                ++n;
             }
 
-            if (*(int *)cqe->user_data == me->n.notify_event_fd) {
-                LOG("pipe (new connection)\n");
-                thread_libevent_process(me->n.notify_event_fd, 0, me);
-            } else {
-                LOG("socket (read|sendmsg)\n");
-                c = (conn *)cqe->user_data;
-                c->cqe = cqe;
-                drive_machine(c);
-            }
-
-            ++n;
+            // if (n > 0)
+            //     printf("batch processed %d conn(s)\n", n);
+            io_uring_cq_advance(&ring, n);
+        } else {
+            LOG("io_uring_submit_and_wait_timeout failed\n");
         }
-
-        io_uring_cq_advance(&ring, n);
-        //io_uring_cqe_seen(&ring, cqe);
-
     }
 #else
     event_base_loop(me->base, 0);
