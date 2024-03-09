@@ -556,17 +556,17 @@ static void *worker_libevent(void *arg) {
 
     while (1) {
         // TODO: timeout & batchsize
-        int ret = io_uring_submit_and_wait_timeout(&ring, &cqe, 10, &ts, NULL);
-        // int ret = io_uring_submit_and_wait(&ring, 1);
+        // int ret = io_uring_submit_and_wait_timeout(&ring, &cqe, 10, &ts, NULL);
+        int ret = io_uring_submit_and_wait(&ring, 1);
 
         // TODO: error handling
-        if (ret >= 0 || ret == -ETIME) {
+        if (ret >= 0 || /*  ret == -ETIME */) {
             n = 0;
 
             io_uring_for_each_cqe(&ring, head, cqe) {
                 LOG("new cqe| ");
                 if (cqe->res < 0) {
-                    printf("syscall failed\n");
+                    LOG("syscall failed\n");
                 }
 
                 if (*(int *)cqe->user_data == me->n.notify_event_fd) {

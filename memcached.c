@@ -3191,8 +3191,10 @@ void drive_machine(conn *c) {
                         io_uring_get_sqe(c->thread->ring);
                     io_uring_prep_poll_add(sqe, c->sfd, POLLOUT);
                     io_uring_sqe_set_data(sqe, c);
+                    stop = true;
+                } else {
+                    conn_set_state(c, conn_read);
                 }
-                stop = true;
             }
             break;
 
@@ -3374,6 +3376,8 @@ void drive_machine(conn *c) {
                 }
 
                 if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    LOG("should not happen!");
+                    exit(1);
                     if (!update_event(c, EV_READ | EV_PERSIST)) {
                         if (settings.verbose > 0)
                             fprintf(stderr, "Couldn't update event\n");
