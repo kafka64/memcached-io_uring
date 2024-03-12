@@ -1480,6 +1480,7 @@ static void reset_cmd_handler(conn *c) {
         conn_set_state(c, conn_mwrite);
     } else {
 #ifdef IO_URING
+        rbuf_release(c);
         conn_set_state(c, conn_read);
 #else
         conn_set_state(c, conn_waiting);
@@ -3193,6 +3194,7 @@ void drive_machine(conn *c) {
                     io_uring_sqe_set_data(sqe, c);
                     stop = true;
                 } else {
+                    rbuf_release(c);
                     conn_set_state(c, conn_read);
                 }
             }
@@ -3214,32 +3216,6 @@ void drive_machine(conn *c) {
                     c->rcurr = c->rbuf;
                 }
 
-                // TODO: handle large input?
-#if 0
-            // TODO: move to rbuf_* func?
-            if (c->rbytes >= c->rsize && c->rbuf_malloced) {
-              if (num_allocs == 4) {
-                return gotdata;
-              }
-              ++num_allocs;
-              char *new_rbuf = realloc(c->rbuf, c->rsize * 2);
-              if (!new_rbuf) {
-                STATS_LOCK();
-                stats.malloc_fails++;
-                STATS_UNLOCK();
-                if (settings.verbose > 0) {
-                  fprintf(stderr, "Couldn't realloc input buffer\n");
-                }
-                c->rbytes = 0; /* ignore what we read */
-                out_of_memory(c, "SERVER_ERROR out of memory reading request");
-                c->close_after_write = true;
-                return READ_MEMORY_ERROR;
-              }
-              c->rcurr = c->rbuf = new_rbuf;
-              c->rsize *= 2;
-            }
-#endif
-
                 avail = c->rsize - c->rbytes;
 
                 sqe = io_uring_get_sqe(c->thread->ring);
@@ -3259,16 +3235,11 @@ void drive_machine(conn *c) {
                     pthread_mutex_unlock(&c->thread->stats.mutex);
                     gotdata = READ_DATA_RECEIVED;
                     c->rbytes += res;
-// TODO: larger buffer?
-#if 0
-              if (res == avail && c->rbuf_malloced) {
-                // Resize rbuf and try a few times if huge ascii multiget.
-                continue;
-              } else {
-                break;
-              }
-#endif
                 }
+                if (res == -1) {
+                    gotdata = READ_NO_DATA_RECEIVED;
+                }
+
                 if (res == 0) {
                     c->close_reason = NORMAL_CLOSE;
                     gotdata = READ_ERROR;
@@ -3299,6 +3270,7 @@ void drive_machine(conn *c) {
                     // Buffered responses waiting, flush in the meantime.
                     conn_set_state(c, conn_mwrite);
                 } else {
+                    rbuf_release(c);
                     conn_set_state(c, conn_read);
                 }
             }
@@ -3314,7 +3286,8 @@ void drive_machine(conn *c) {
                 /* Check if rbytes < 0, to prevent crash */
                 if (c->rlbytes < 0) {
                     if (settings.verbose) {
-                        fprintf(stderr, "Invalid rlbytes to read: len %d\n", c->rlbytes);
+                        fprintf(stderr, "Invalid rlbytes to read: len %d\n",
+                                c->rlbytes);
                     }
                     conn_set_state(c, conn_closing);
                     break;
@@ -3420,22 +3393,115 @@ void drive_machine(conn *c) {
         case conn_write:
         case conn_mwrite:
 #ifdef HYBRID
-            // inlining transmit for now
-            // init the msg.
-            memset(&c->msg, 0, sizeof(struct msghdr));
-            c->msg.msg_iov = c->iovs;
+            if (!c->wait_cqe) {
+                iovused = _transmit_pre(c, c->iovs, iovused, TRANSMIT_ALL_RESP);
+                if (iovused == 0) {
+                    // Avoid the syscall if we're only handling a noreply.
+                    // Return the response object.
+                    _transmit_post(c, 0);
+                    sentdata = TRANSMIT_COMPLETE;
+                } else {
+                    // inlining transmit for now
+                    // init the msg.
+                    memset(&c->msg, 0, sizeof(struct msghdr));
+                    c->msg.msg_iov = c->iovs;
 
-            iovused = _transmit_pre(c, c->iovs, iovused, TRANSMIT_ALL_RESP);
-            if (iovused == 0) {
-                // Avoid the syscall if we're only handling a noreply.
-                // Return the response object.
-                _transmit_post(c, 0);
-                sentdata = TRANSMIT_COMPLETE;
+                    c->msg.msg_iovlen = iovused;
+                    res = c->sendmsg(c, &c->msg, 0);
+
+                    if (res == -1 &&
+                        (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        // Alright, send.
+                        sqe = io_uring_get_sqe(c->thread->ring);
+                        io_uring_prep_sendmsg(sqe, c->sfd, &c->msg, 0);
+                        io_uring_sqe_set_data(sqe, c);
+                        c->wait_cqe = true;
+
+                        stop = true;
+                        break;
+                    }
+                }
             } else {
-                ssize_t res;
-                c->msg.msg_iovlen = iovused;
-                res = c->sendmsg(c, &c->msg, 0);
+                // res = c->sendmsg(c, &msg, 0);
+                c->wait_cqe = false;
+                res = c->cqe->res;
+            }
 
+            if (res >= 0) {
+                pthread_mutex_lock(&c->thread->stats.mutex);
+                c->thread->stats.bytes_written += res;
+                pthread_mutex_unlock(&c->thread->stats.mutex);
+
+                // Decrement any partial IOV's and complete any finished
+                // resp's.
+                _transmit_post(c, res);
+
+                if (c->resp_head) {
+                    sentdata = TRANSMIT_INCOMPLETE;
+                } else {
+                    sentdata = TRANSMIT_COMPLETE;
+                }
+            } else {
+                if (settings.verbose > 0)
+                    perror("Failed to write, and not due to blocking");
+                conn_set_state(c, conn_closing);
+                sentdata = TRANSMIT_HARD_ERROR;
+            }
+
+            switch (sentdata) {
+            case TRANSMIT_COMPLETE:
+                if (c->state == conn_mwrite) {
+                    // Free up IO wraps and any half-uploaded items.
+                    conn_release_items(c);
+                    conn_set_state(c, conn_new_cmd);
+                    if (c->close_after_write) {
+                        conn_set_state(c, conn_closing);
+                    }
+                } else {
+                    if (settings.verbose > 0)
+                        fprintf(stderr, "Unexpected state %d\n", c->state);
+                    conn_set_state(c, conn_closing);
+                }
+                break;
+
+            case TRANSMIT_INCOMPLETE:
+            case TRANSMIT_HARD_ERROR:
+                break; /* Continue in state machine. */
+
+            case TRANSMIT_SOFT_ERROR: // should not be reached!!
+                exit(1);
+                stop = true;
+                break;
+            }
+            break;
+#else
+            if (!c->wait_cqe) {
+                // inlining transmit for now
+                iovused = _transmit_pre(c, c->iovs, iovused, TRANSMIT_ALL_RESP);
+                if (iovused == 0) {
+                    // Avoid the syscall if we're only handling a noreply.
+                    // Return the response object.
+                    _transmit_post(c, 0);
+                    sentdata = TRANSMIT_COMPLETE;
+                } else {
+                    // init the msg.
+                    memset(&c->msg, 0, sizeof(struct msghdr));
+                    c->msg.msg_iov = c->iovs;
+
+                    // Alright, send.
+                    c->msg.msg_iovlen = iovused;
+                    sqe = io_uring_get_sqe(c->thread->ring);
+                    io_uring_prep_sendmsg(sqe, c->sfd, &c->msg, 0);
+                    io_uring_sqe_set_data(sqe, c);
+                    c->wait_cqe = true;
+
+                    stop = true;
+                    break;
+                }
+            } else {
+                // res = c->sendmsg(c, &msg, 0);
+                c->wait_cqe = false;
+                res = c->cqe->res;
                 if (res >= 0) {
                     pthread_mutex_lock(&c->thread->stats.mutex);
                     c->thread->stats.bytes_written += res;
@@ -3450,19 +3516,9 @@ void drive_machine(conn *c) {
                     } else {
                         sentdata = TRANSMIT_COMPLETE;
                     }
-                }
-
-                if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    sqe = io_uring_get_sqe(c->thread->ring);
-                    io_uring_prep_poll_add(sqe, c->sfd, POLLOUT);
-                    io_uring_sqe_set_data(sqe, c);
-                    sentdata = TRANSMIT_SOFT_ERROR;
-                } else if (res < 0) {
-                    /* if res == -1 and error is not EAGAIN or EWOULDBLOCK,
-                      we have a real error, on which we close the connection */
+                } else {
                     if (settings.verbose > 0)
-                        if (settings.verbose > 0)
-                            perror("Failed to write, and not due to blocking");
+                        perror("Failed to write, and not due to blocking");
 
                     conn_set_state(c, conn_closing);
                     sentdata = TRANSMIT_HARD_ERROR;
@@ -3489,113 +3545,12 @@ void drive_machine(conn *c) {
             case TRANSMIT_HARD_ERROR:
                 break; /* Continue in state machine. */
 
-            case TRANSMIT_SOFT_ERROR:
+            case TRANSMIT_SOFT_ERROR: // shouldn't happen
                 stop = true;
                 break;
-            }
-            break;
-#else
-            if (!c->wait_cqe) {
-
-                // this should never bite us as we are not using external
-                // storage?
-#if 0
-        /* have side IO's that must process before transmit() can run.
-         * remove the connection from the worker thread and dispatch the
-         * IO queue
-         */
-        assert(c->io_queues_submitted == 0);
-
-        for (io_queue_t *q = c->io_queues; q->type != IO_QUEUE_NONE; q++) {
-          if (q->stack_ctx != NULL) {
-            io_queue_cb_t *qcb = thread_io_queue_get(c->thread, q->type);
-            qcb->submit_cb(q);
-            c->io_queues_submitted++;
-          }
-        }
-        if (c->io_queues_submitted != 0) {
-          conn_set_state(c, conn_io_queue);
-
-          stop = true;
-          break;
-        }
-#endif
-                // inlining transmit for now
-                // init the msg.
-                memset(&c->msg, 0, sizeof(struct msghdr));
-                c->msg.msg_iov = c->iovs;
-
-                iovused = _transmit_pre(c, c->iovs, iovused, TRANSMIT_ALL_RESP);
-                if (iovused == 0) {
-                    // Avoid the syscall if we're only handling a noreply.
-                    // Return the response object.
-                    _transmit_post(c, 0);
-                    sentdata = TRANSMIT_COMPLETE;
-                }
-
-                // Alright, send.
-                c->msg.msg_iovlen = iovused;
-                sqe = io_uring_get_sqe(c->thread->ring);
-                io_uring_prep_sendmsg(sqe, c->sfd, &c->msg, 0);
-                io_uring_sqe_set_data(sqe, c);
-                c->wait_cqe = true;
-
-                stop = true;
-                break;
-            } else {
-                // res = c->sendmsg(c, &msg, 0);
-                c->wait_cqe = false;
-                res = c->cqe->res;
-                if (res >= 0) {
-                    pthread_mutex_lock(&c->thread->stats.mutex);
-                    c->thread->stats.bytes_written += res;
-                    pthread_mutex_unlock(&c->thread->stats.mutex);
-
-                    // Decrement any partial IOV's and complete any finished
-                    // resp's.
-                    _transmit_post(c, res);
-
-                    if (c->resp_head) {
-                        sentdata = TRANSMIT_INCOMPLETE;
-                    } else {
-                        sentdata = TRANSMIT_COMPLETE;
-                    }
-                } else {
-                    if (settings.verbose > 0)
-                        perror("Failed to write, and not due to blocking");
-
-                    conn_set_state(c, conn_closing);
-                    sentdata = TRANSMIT_HARD_ERROR;
-                }
-
-                switch (sentdata) {
-                case TRANSMIT_COMPLETE:
-                    if (c->state == conn_mwrite) {
-                        // Free up IO wraps and any half-uploaded items.
-                        conn_release_items(c);
-                        conn_set_state(c, conn_new_cmd);
-                        if (c->close_after_write) {
-                            conn_set_state(c, conn_closing);
-                        }
-                    } else {
-                        if (settings.verbose > 0)
-                            fprintf(stderr, "Unexpected state %d\n", c->state);
-                        conn_set_state(c, conn_closing);
-                    }
-                    break;
-
-                case TRANSMIT_INCOMPLETE:
-                case TRANSMIT_HARD_ERROR:
-                    break; /* Continue in state machine. */
-
-                case TRANSMIT_SOFT_ERROR: // shouldn't happen
-                    stop = true;
-                    break;
-                }
             }
             break;
 #endif // HYBRID
-
 #else
         case conn_waiting:
             rbuf_release(c);

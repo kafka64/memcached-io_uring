@@ -560,7 +560,7 @@ static void *worker_libevent(void *arg) {
         int ret = io_uring_submit_and_wait(&ring, 1);
 
         // TODO: error handling
-        if (ret >= 0 || /*  ret == -ETIME */) {
+        if (ret >= 0 /* ||  ret == -ETIME */) {
             n = 0;
 
             io_uring_for_each_cqe(&ring, head, cqe) {
