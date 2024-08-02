@@ -539,6 +539,33 @@ static void *worker_libevent(void *arg) {
                             IORING_SETUP_DEFER_TASKRUN |
                             IORING_SETUP_COOP_TASKRUN);
 
+#ifdef MULTISHOT
+    int ret;
+
+    if (posix_memalign((void **)&(me->buf), 4096, NR_BUFS * BUF_SIZE)) {
+        perror("posix memalign");
+        exit(1);
+    }
+
+    LOG("ring buffer allocated\n");
+
+    me->br = io_uring_setup_buf_ring((me->ring), NR_BUFS, BGID, 0, &ret);
+
+    if (!me->br) {
+        fprintf(stderr, "Buffer ring register failed %d %s\n", ret, strerror(errno));
+        exit(1);
+    }
+
+    void* ptr = me->buf;
+    for (int i = 0; i < NR_BUFS; ++i) {
+        io_uring_buf_ring_add(me->br, ptr, BUF_SIZE, i, BR_MASK, i);
+        ptr += BUF_SIZE;
+    }
+    io_uring_buf_ring_advance(me->br, NR_BUFS);
+
+    LOG("registered ring provided buffers\n");
+#endif
+
     LOG("adding polling events for wakeup pipe\n");
     sqe = io_uring_get_sqe(&ring);
     io_uring_prep_poll_multishot(sqe, me->n.notify_event_fd, POLLIN);
@@ -554,6 +581,8 @@ static void *worker_libevent(void *arg) {
     unsigned head;
     unsigned n;
 
+    unsigned nb;
+
     while (1) {
         // TODO: timeout & batchsize
         // int ret = io_uring_submit_and_wait_timeout(&ring, &cqe, 10, &ts, NULL);
@@ -567,16 +596,41 @@ static void *worker_libevent(void *arg) {
                 LOG("new cqe| ");
                 if (cqe->res < 0) {
                     LOG("syscall failed\n");
-                }
-
-                if (*(int *)cqe->user_data == me->n.notify_event_fd) {
-                    LOG("pipe (new connection)\n");
-                    thread_libevent_process(me->n.notify_event_fd, 0, me);
-                } else {
-                    LOG("socket (read|sendmsg)\n");
                     c = (conn *)cqe->user_data;
-                    c->cqe = cqe;
+                    conn_set_state(c, conn_closing);
                     drive_machine(c);
+                } else {
+                    if (*(int *)cqe->user_data == me->n.notify_event_fd) {
+                        LOG("pipe (new connection)\n");
+                        thread_libevent_process(me->n.notify_event_fd, 0, me);
+                    } else {
+                        c = (conn *)cqe->user_data;
+#ifdef MULTISHOT
+                        if (cqe->flags & IORING_CQE_F_BUFFER) {
+                            LOG("multishot recv\n");
+                            c->cqes[c->h] = cqe;
+                            c->h = (c->h + 1) % NCQES;
+                            nb = ++c->l;
+                            if (c->wait_rcqe) {
+                                c->p = 0;
+                                drive_machine(c);
+                                if (cqe->flags & IORING_CQE_F_BUFFER) {
+                                    //int bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+                                    //io_uring_buf_ring_add(me->br, me->buf + BUF_SIZE * bid, BUF_SIZE, bid, BR_MASK, 0);
+                                    io_uring_buf_ring_advance(me->br, c->p);
+                                }
+                            }
+                        } else {
+                            LOG("sendmsg\n");
+                            c->cqe = cqe;
+                            drive_machine(c);
+                        }
+#else
+                        LOG("socket (read|sendmsg)\n");
+                        c->cqe = cqe;
+                        drive_machine(c);
+#endif
+                    }
                 }
 
                 ++n;
@@ -585,6 +639,7 @@ static void *worker_libevent(void *arg) {
             // if (n > 0)
             //     printf("batch processed %d conn(s)\n", n);
             io_uring_cq_advance(&ring, n);
+            LOG("processed %d CQEs\n", n);
         } else {
             LOG("io_uring_submit_and_wait_timeout failed\n");
         }
@@ -594,6 +649,10 @@ static void *worker_libevent(void *arg) {
 #endif
 
     LOG("thread exiting\n");
+
+#ifdef MULTISHOT
+    io_uring_free_buf_ring(me->ring, me->br, NR_BUFS, BGID);
+#endif
 
     // same mechanism used to watch for all threads exiting.
     register_thread_initialized();
@@ -705,7 +764,23 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
                     c->thread = me;
                     conn_io_queue_setup(c);
 #ifdef IO_URING
+#ifdef MULTISHOT
+                    for (int i = 0; i < NCQES; ++i) {
+                        c->cqes[i] = NULL;
+                    }
+                    c->l = c->t = c->h = 0;
+                    // arm multishot
+                    c->wait_rcqe = true;
+                    struct io_uring_sqe* sqe;
+                    sqe = io_uring_get_sqe(me->ring);
+                    io_uring_prep_recv_multishot(sqe, c->sfd, NULL, 0, 0);
+                    io_uring_sqe_set_data(sqe, c);
+                    sqe->buf_group = BGID;
+                    sqe->flags |= IOSQE_BUFFER_SELECT;
+#endif
+#ifndef MULTISHOT
                     drive_machine(c);
+#endif
 #endif
 #ifdef TLS
                     if (settings.ssl_enabled && c->ssl != NULL) {

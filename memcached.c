@@ -1474,7 +1474,7 @@ static void reset_cmd_handler(conn *c) {
     } else if (c->resp_head) {
         conn_set_state(c, conn_mwrite);
     } else {
-#ifdef IO_URING
+#if defined(IO_URING) && ! defined(MULTISHOT)
         rbuf_release(c);
         conn_set_state(c, conn_read);
 #else
@@ -3117,6 +3117,370 @@ void drive_machine(conn *c) {
         LOG("conn state: %s\n", state_text(c->state));
 
         switch(c->state) {
+#ifdef MULTISHOT
+        case conn_listening:
+            addrlen = sizeof(addr);
+#ifdef HAVE_ACCEPT4
+            if (use_accept4) {
+                sfd = accept4(c->sfd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
+            } else {
+                sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+            }
+#else
+            sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+#endif
+            if (sfd == -1) {
+                if (use_accept4 && errno == ENOSYS) {
+                    use_accept4 = 0;
+                    continue;
+                }
+                perror(use_accept4 ? "accept4()" : "accept()");
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    /* these are transient, so don't log anything */
+                    stop = true;
+                } else if (errno == EMFILE) {
+                    if (settings.verbose > 0)
+                        fprintf(stderr, "Too many open connections\n");
+                    accept_new_conns(false);
+                    stop = true;
+                } else {
+                    perror("accept()");
+                    stop = true;
+                }
+                break;
+            }
+            if (!use_accept4) {
+                if (fcntl(sfd, F_SETFL, fcntl(sfd, F_GETFL) | O_NONBLOCK) < 0) {
+                    perror("setting O_NONBLOCK");
+                    close(sfd);
+                    break;
+                }
+            }
+
+            bool reject;
+            if (settings.maxconns_fast) {
+                reject = sfd >= settings.maxconns - 1;
+                if (reject) {
+                    STATS_LOCK();
+                    stats.rejected_conns++;
+                    STATS_UNLOCK();
+                }
+            } else {
+                reject = false;
+            }
+
+            if (reject) {
+                str = "ERROR Too many open connections\r\n";
+                res = write(sfd, str, strlen(str));
+                close(sfd);
+            } else {
+                void *ssl_v = NULL;
+                dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
+                                     READ_BUFFER_CACHED, c->transport, ssl_v, c->tag, c->protocol);
+            }
+            stop = true;
+            break;
+
+        case conn_parse_cmd:
+            c->noreply = false;
+            if (c->try_read_command(c) == 0) {
+                /* we need more data! */
+                if (c->resp_head) {
+                    // Buffered responses waiting, flush in the meantime.
+                    conn_set_state(c, conn_mwrite);
+                } else {
+                    conn_set_state(c, conn_new_cmd);
+                }
+            }
+
+            break;
+
+        case conn_new_cmd:
+
+            if (c->rbuf == NULL) {
+                rbuf_alloc(c);
+            }
+
+            if (c->h == c->t) {
+                c->wait_rcqe = true;
+                stop = true;
+                break;
+            } else if (c->cqes[c->t]->res == 0) {
+                conn_set_state(c, conn_closing);
+            } else {
+                c->wait_rcqe = false;
+                int bid = c->cqes[c->t]->flags >> IORING_CQE_BUFFER_SHIFT;
+                int len = c->cqes[c->t]->res;
+
+                LOG("head: %d\n", c->h);
+                LOG("tail: %d\n", c->t);
+                LOG("bid: %d\n", bid);
+                LOG("length: %d\n", len);
+                LOG("content: %.*s\n", c->cqes[c->t]->res, c->thread->buf + BUF_SIZE * bid);
+                //c->rbuf = c->thread->buf + BUF_SIZE * bid;
+                if (c->rbuf != c->rcurr) {
+                    memmove(c->rbuf, c->rcurr, c->rbytes);
+                    c->rcurr = c->rbuf;
+                }
+                memcpy(c->rbuf, c->thread->buf + BUF_SIZE * bid, len);
+                c->rbytes = c->cqes[c->t]->res;
+                conn_set_state(c, conn_parse_cmd);
+                c->t = (c->t + 1) % NCQES;
+                c->p++;
+            }
+
+            break;
+
+        case conn_nread:
+            if (c->rlbytes == 0) {
+                complete_nread(c);
+                conn_set_state(c, conn_mwrite);
+                break;
+            }
+
+            /* Check if rbytes < 0, to prevent crash */
+            if (c->rlbytes < 0) {
+                if (settings.verbose) {
+                    fprintf(stderr, "Invalid rlbytes to read: len %d\n", c->rlbytes);
+                }
+                conn_set_state(c, conn_closing);
+                break;
+            }
+
+            if (c->item_malloced || ((((item *)c->item)->it_flags & ITEM_CHUNKED) == 0) ) {
+                /* first check if we have leftovers in the conn_read buffer */
+                if (c->rbytes > 0) {
+                    int tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes;
+                    memmove(c->ritem, c->rcurr, tocopy);
+                    c->ritem += tocopy;
+                    c->rlbytes -= tocopy;
+                    c->rcurr += tocopy;
+                    c->rbytes -= tocopy;
+                    if (c->rlbytes == 0) {
+                        break;
+                    }
+                }
+
+                /*  now try reading from the socket */
+                if (c->h == c->t) {
+                    c->wait_rcqe = true;
+                    stop = true;
+                    break;
+                } else if (c->cqes[c->t]->res == 0) {
+                    c->close_reason = NORMAL_CLOSE;
+                    conn_set_state(c, conn_closing);
+                } else if (c->cqes[c->t]->res == -2) {
+                    out_of_memory(c, "SERVER_ERROR Out of memory during read");
+                    c->sbytes = c->rlbytes;
+                    conn_set_state(c, conn_swallow);
+                    // Ensure this flag gets cleared. It gets killed on conn_new()
+                    // so any conn_closing is fine, calling complete_nread is
+                    // fine. This swallow semms to be the only other case.
+                    c->set_stale = false;
+                    c->mset_res = false;
+                    break;
+                } else {
+                    c->wait_rcqe = false;
+                    int bid = c->cqes[c->t]->flags >> IORING_CQE_BUFFER_SHIFT;
+                    int len = c->cqes[c->t]->res;
+
+                    LOG("head: %d\n", c->h);
+                    LOG("tail: %d\n", c->t);
+                    LOG("bid: %d\n", bid);
+                    LOG("length: %d\n", len);
+                    LOG("content: %.*s\n", c->cqes[c->t]->res, c->thread->buf + BUF_SIZE * bid);
+                    if (len > c->rlbytes) {
+                        if (len > c->rlbytes) {
+                            memcpy(c->rbuf, c->thread->buf + BUF_SIZE * bid + c->rlbytes, len - c->rlbytes);
+                            c->rcurr = c->rbuf;
+                        }
+                        memcpy(c->ritem, c->thread->buf + BUF_SIZE * bid, c->rlbytes);
+                        res = c->rlbytes;
+                    } else {
+                        memcpy(c->ritem, c->thread->buf + BUF_SIZE * bid, len);
+                        res = len;
+                    }
+
+                    pthread_mutex_lock(&c->thread->stats.mutex);
+                    c->thread->stats.bytes_read += len;
+                    pthread_mutex_unlock(&c->thread->stats.mutex);
+
+                    c->ritem += res;
+                    c->rlbytes -= res;
+                    c->t = (c->t + 1) % NCQES;
+                    c->p++;
+                    break;
+                }
+            }
+
+            /* otherwise we have a real error, on which we close the connection */
+            if (settings.verbose > 0) {
+                fprintf(stderr, "Failed to read, and not due to blocking:\n"
+                        "errno: %d %s \n"
+                        "rcurr=%p ritem=%p rbuf=%p rlbytes=%d rsize=%d\n",
+                        errno, strerror(errno),
+                        (void *)c->rcurr, (void *)c->ritem, (void *)c->rbuf,
+                        (int)c->rlbytes, (int)c->rsize);
+            }
+            conn_set_state(c, conn_closing);
+            break;
+        case conn_swallow:
+            /* we are reading sbytes and throwing them away */
+            if (c->sbytes <= 0) {
+                conn_set_state(c, conn_new_cmd);
+                break;
+            }
+
+            /* first check if we have leftovers in the conn_read buffer */
+            if (c->rbytes > 0) {
+                int tocopy = c->rbytes > c->sbytes ? c->sbytes : c->rbytes;
+                c->sbytes -= tocopy;
+                c->rcurr += tocopy;
+                c->rbytes -= tocopy;
+                break;
+            }
+
+            /*  now try reading from the socket */
+            res = c->read(c, c->rbuf, c->rsize > c->sbytes ? c->sbytes : c->rsize);
+            if (res > 0) {
+                pthread_mutex_lock(&c->thread->stats.mutex);
+                c->thread->stats.bytes_read += res;
+                pthread_mutex_unlock(&c->thread->stats.mutex);
+                c->sbytes -= res;
+                break;
+            }
+            if (res == 0) { /* end of stream */
+                c->close_reason = NORMAL_CLOSE;
+                conn_set_state(c, conn_closing);
+                break;
+            }
+            if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                if (!update_event(c, EV_READ | EV_PERSIST)) {
+                    if (settings.verbose > 0)
+                        fprintf(stderr, "Couldn't update event\n");
+                    conn_set_state(c, conn_closing);
+                    break;
+                }
+                stop = true;
+                break;
+            }
+            /* otherwise we have a real error, on which we close the connection */
+            if (settings.verbose > 0)
+                fprintf(stderr, "Failed to read, and not due to blocking\n");
+            conn_set_state(c, conn_closing);
+            break;
+
+        case conn_write:
+        case conn_mwrite:
+            if (!c->wait_cqe) {
+
+                memset(&c->msg, 0, sizeof(struct msghdr));
+                c->msg.msg_iov = c->iovs;
+
+                iovused = _transmit_pre(c, c->iovs, iovused, TRANSMIT_ALL_RESP);
+                if (iovused == 0) {
+                    // Avoid the syscall if we're only handling a noreply.
+                    // Return the response object.
+                    _transmit_post(c, 0);
+                    sentdata = TRANSMIT_COMPLETE;
+                }
+
+                // Alright, send.
+                c->msg.msg_iovlen = iovused;
+                sqe = io_uring_get_sqe(c->thread->ring);
+                io_uring_prep_sendmsg(sqe, c->sfd, &c->msg, 0);
+                io_uring_sqe_set_data(sqe, c);
+                c->wait_cqe = true;
+
+                stop = true;
+                break;
+            } else {
+                c->wait_cqe = false;
+                res = c->cqe->res;
+                if (res >= 0) {
+                    pthread_mutex_lock(&c->thread->stats.mutex);
+                    c->thread->stats.bytes_written += res;
+                    pthread_mutex_unlock(&c->thread->stats.mutex);
+
+                    // Decrement any partial IOV's and complete any finished
+                    // resp's.
+                    _transmit_post(c, res);
+
+                    if (c->resp_head) {
+                        sentdata = TRANSMIT_INCOMPLETE;
+                    } else {
+                        sentdata = TRANSMIT_COMPLETE;
+                    }
+                } else {
+                    if (settings.verbose > 0)
+                        perror("Failed to write, and not due to blocking");
+
+                    conn_set_state(c, conn_closing);
+                    sentdata = TRANSMIT_HARD_ERROR;
+                }
+
+                switch (sentdata) {
+                case TRANSMIT_COMPLETE:
+                    if (c->state == conn_mwrite) {
+                        // Free up IO wraps and any half-uploaded items.
+                        conn_release_items(c);
+                        conn_set_state(c, conn_new_cmd);
+                        if (c->close_after_write) {
+                            conn_set_state(c, conn_closing);
+                        }
+                    } else {
+                        if (settings.verbose > 0)
+                            fprintf(stderr, "Unexpected state %d\n", c->state);
+                        conn_set_state(c, conn_closing);
+                    }
+                    break;
+
+                case TRANSMIT_INCOMPLETE:
+                case TRANSMIT_HARD_ERROR:
+                    break; /* Continue in state machine. */
+
+                case TRANSMIT_SOFT_ERROR: // shouldn't happen
+                    stop = true;
+                    break;
+                }
+            }
+            break;
+
+        case conn_closing:
+            if (IS_UDP(c->transport))
+                conn_cleanup(c);
+            else
+                conn_close(c);
+            stop = true;
+            break;
+
+        case conn_closed:
+            /* This only happens if dormando is an idiot. */
+            abort();
+            break;
+
+        case conn_watch:
+            /* We handed off our connection to the logger thread. */
+            stop = true;
+            break;
+        case conn_io_queue:
+            /* Woke up while waiting for an async return, but not ready. */
+            event_del(&c->event);
+            conn_set_state(c, conn_io_pending);
+            stop = true;
+            break;
+        case conn_io_pending:
+            /* Should not be reachable */
+            assert(false);
+            break;
+        case conn_io_resume:
+            /* Complete our queued IO's from within the worker thread. */
+            conn_set_state(c, conn_mwrite);
+            break;
+        case conn_max_state:
+            assert(false);
+            break;
+#else
         case conn_listening:
             addrlen = sizeof(addr);
 #ifdef HAVE_ACCEPT4
@@ -3601,6 +3965,7 @@ void drive_machine(conn *c) {
         case conn_max_state:
             assert(false);
             break;
+#endif
         }
     }
 
